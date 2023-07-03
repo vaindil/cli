@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/cli/cli/v2/api"
 	ghContext "github.com/cli/cli/v2/context"
 	"github.com/cli/cli/v2/git"
@@ -59,6 +61,7 @@ type CreateOptions struct {
 	Milestone string
 
 	MaintainerCanModify bool
+	Template            string
 }
 
 type CreateContext struct {
@@ -127,6 +130,12 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 
 			opts.TitleProvided = cmd.Flags().Changed("title")
 			opts.RepoOverride, _ = cmd.Flags().GetString("repo")
+			// Workaround: Due to the way this command is implemented, we need to manually check GH_REPO.
+			// Commands should use the standard BaseRepoOverride functionality to handle this behavior instead.
+			if opts.RepoOverride == "" {
+				opts.RepoOverride = os.Getenv("GH_REPO")
+			}
+
 			noMaintainerEdit, _ := cmd.Flags().GetBool("no-maintainer-edit")
 			opts.MaintainerCanModify = !noMaintainerEdit
 
@@ -152,6 +161,10 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 				}
 				opts.Body = string(b)
 				opts.BodyProvided = true
+			}
+
+			if opts.Template != "" && opts.BodyProvided {
+				return errors.New("`--template` is not supported when using `--body` or `--body-file`")
 			}
 
 			if !opts.IO.CanPrompt() && !opts.WebMode && !opts.Autofill && (!opts.TitleProvided || !opts.BodyProvided) {
@@ -181,6 +194,9 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	fl.StringVarP(&opts.Milestone, "milestone", "m", "", "Add the pull request to a milestone by `name`")
 	fl.Bool("no-maintainer-edit", false, "Disable maintainer's ability to modify pull request")
 	fl.StringVar(&opts.RecoverFile, "recover", "", "Recover input from a failed run of create")
+	fl.StringVarP(&opts.Template, "template", "T", "", "Template `file` to use as starting body text")
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base", "head")
 
 	_ = cmd.RegisterFlagCompletionFunc("reviewer", func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		results, err := requestableReviewersForCompletion(opts)
@@ -294,15 +310,21 @@ func createRun(opts *CreateOptions) (err error) {
 		if opts.RecoverFile == "" {
 			tpl := shared.NewTemplateManager(client.HTTP(), ctx.BaseRepo, opts.Prompter, opts.RootDirOverride, opts.RepoOverride == "", true)
 			var template shared.Template
-			template, err = tpl.Choose()
-			if err != nil {
-				return
+
+			if opts.Template != "" {
+				template, err = tpl.Select(opts.Template)
+				if err != nil {
+					return
+				}
+			} else {
+				template, err = tpl.Choose()
+				if err != nil {
+					return
+				}
 			}
 
 			if template != nil {
 				templateContent = string(template.Body())
-			} else {
-				templateContent = string(tpl.LegacyBody())
 			}
 		}
 
@@ -714,24 +736,51 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	// missing:
 	// 1. the head repo was just created by auto-forking;
 	// 2. an existing fork was discovered by querying the API.
-	//
 	// In either case, we want to add the head repo as a new git remote so we
-	// can push to it.
+	// can push to it. We will try to add the head repo as the "origin" remote
+	// and fallback to the "fork" remote if it is unavailable. Also, if the
+	// base repo is the "origin" remote we will rename it "upstream".
 	if headRemote == nil && ctx.IsPushEnabled {
 		cfg, err := opts.Config()
 		if err != nil {
 			return err
 		}
+
+		remotes, err := opts.Remotes()
+		if err != nil {
+			return err
+		}
+
 		cloneProtocol, _ := cfg.GetOrDefault(headRepo.RepoHost(), "git_protocol")
-
 		headRepoURL := ghrepo.FormatRemoteURL(headRepo, cloneProtocol)
-
-		// TODO: prevent clashes with another remote of a same name
 		gitClient := ctx.GitClient
-		gitRemote, err := gitClient.AddRemote(context.Background(), "fork", headRepoURL, []string{})
+		origin, _ := remotes.FindByName("origin")
+		upstream, _ := remotes.FindByName("upstream")
+		remoteName := "origin"
+
+		if origin != nil {
+			remoteName = "fork"
+		}
+
+		if origin != nil && upstream == nil && ghrepo.IsSame(origin, ctx.BaseRepo) {
+			renameCmd, err := gitClient.Command(context.Background(), "remote", "rename", "origin", "upstream")
+			if err != nil {
+				return err
+			}
+			if _, err = renameCmd.Output(); err != nil {
+				return fmt.Errorf("error renaming origin remote: %w", err)
+			}
+			remoteName = "origin"
+			fmt.Fprintf(opts.IO.ErrOut, "Changed %s remote to %q\n", ghrepo.FullName(ctx.BaseRepo), "upstream")
+		}
+
+		gitRemote, err := gitClient.AddRemote(context.Background(), remoteName, headRepoURL, []string{})
 		if err != nil {
 			return fmt.Errorf("error adding remote: %w", err)
 		}
+
+		fmt.Fprintf(opts.IO.ErrOut, "Added %s as remote %q\n", ghrepo.FullName(headRepo), remoteName)
+
 		headRemote = &ghContext.Remote{
 			Remote: gitRemote,
 			Repo:   headRepo,
@@ -741,27 +790,23 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	// automatically push the branch if it hasn't been pushed anywhere yet
 	if ctx.IsPushEnabled {
 		pushBranch := func() error {
-			pushTries := 0
-			maxPushTries := 3
-			for {
-				w := NewRegexpWriter(opts.IO.ErrOut, gitPushRegexp, "")
-				defer w.Flush()
-				gitClient := ctx.GitClient
-				ref := fmt.Sprintf("HEAD:%s", ctx.HeadBranch)
-				if err := gitClient.Push(context.Background(), headRemote.Name, ref, git.WithStderr(w)); err != nil {
-					if didForkRepo && pushTries < maxPushTries {
-						pushTries++
-						// first wait 2 seconds after forking, then 4s, then 6s
-						waitSeconds := 2 * pushTries
-						fmt.Fprintf(opts.IO.ErrOut, "waiting %s before retrying...\n", text.Pluralize(waitSeconds, "second"))
-						time.Sleep(time.Duration(waitSeconds) * time.Second)
-						continue
+			w := NewRegexpWriter(opts.IO.ErrOut, gitPushRegexp, "")
+			defer w.Flush()
+			gitClient := ctx.GitClient
+			ref := fmt.Sprintf("HEAD:%s", ctx.HeadBranch)
+			bo := backoff.NewConstantBackOff(2 * time.Second)
+			ctx := context.Background()
+			return backoff.Retry(func() error {
+				if err := gitClient.Push(ctx, headRemote.Name, ref, git.WithStderr(w)); err != nil {
+					// Only retry if we have forked the repo else the push should succeed the first time.
+					if didForkRepo {
+						fmt.Fprintf(opts.IO.ErrOut, "waiting 2 seconds before retrying...\n")
+						return err
 					}
-					return err
+					return backoff.Permanent(err)
 				}
-				break
-			}
-			return nil
+				return nil
+			}, backoff.WithContext(backoff.WithMaxRetries(bo, 3), ctx))
 		}
 
 		err := pushBranch()
